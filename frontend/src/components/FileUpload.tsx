@@ -6,18 +6,25 @@ interface UploadPreviewResponse {
   columns: string[];
   totalRows: number;
   totalColumns: number;
+  duplicateRows: number;
+  duplicateGroups: number;
   previewRows: PreviewRow[];
+  allRows: PreviewRow[];
   hasMoreRows: boolean;
   hasManyColumns: boolean;
   processingTimeSeconds: number;
 }
 
 interface PreviewRow {
-  [key: string]: string | number | boolean | null;
+  isDuplicate?: boolean;
+  duplicateGroup?: number | null;
+  [key: string]: string | number | boolean | null | undefined;
 }
 
 // FileUpload component — handles Excel file selection and upload
 function FileUpload(): JSX.Element {
+  const PAGE_SIZE = 25;
+
   // Track the selected file and UI messages
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
@@ -25,6 +32,7 @@ function FileUpload(): JSX.Element {
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [previewData, setPreviewData] = useState<UploadPreviewResponse | null>(null);
+  const [currentPage, setCurrentPage] = useState<number>(1);
 
   // Called whenever the user picks a file from the input
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>): void => {
@@ -35,6 +43,7 @@ function FileUpload(): JSX.Element {
     setSuccessMessage(null);
     setErrorMessage(null);
     setPreviewData(null);
+    setCurrentPage(1);
   };
 
   // Upload the selected file to the backend
@@ -59,6 +68,7 @@ function FileUpload(): JSX.Element {
 
       setPreviewData(response.data);
       setSuccessMessage('File preview loaded successfully.');
+      setCurrentPage(1);
     } catch (error: unknown) {
       if (axios.isAxiosError<{ detail?: string }>(error)) {
         const detail = error.response?.data?.detail;
@@ -75,6 +85,12 @@ function FileUpload(): JSX.Element {
       setIsUploading(false);
     }
   };
+
+  const allRows = previewData?.allRows ?? [];
+  const totalPages = Math.max(1, Math.ceil(allRows.length / PAGE_SIZE));
+  const startIndex = (currentPage - 1) * PAGE_SIZE;
+  const endIndex = Math.min(startIndex + PAGE_SIZE, allRows.length);
+  const pagedRows = allRows.slice(startIndex, endIndex);
 
   return (
     <div style={styles.container}>
@@ -113,9 +129,20 @@ function FileUpload(): JSX.Element {
 
       {previewData && (
         <div style={styles.previewSection}>
-          <p style={styles.summaryText}>
-            Total rows: {previewData.totalRows}
-          </p>
+          <div style={styles.summaryGrid}>
+            <div style={styles.summaryCard}>
+              <p style={styles.summaryLabel}>Total rows</p>
+              <p style={styles.summaryValue}>{previewData.totalRows}</p>
+            </div>
+            <div style={styles.summaryCard}>
+              <p style={styles.summaryLabel}>Duplicate rows</p>
+              <p style={styles.summaryValue}>{previewData.duplicateRows}</p>
+            </div>
+            <div style={styles.summaryCard}>
+              <p style={styles.summaryLabel}>Duplicate groups</p>
+              <p style={styles.summaryValue}>{previewData.duplicateGroups}</p>
+            </div>
+          </div>
 
           <div style={styles.tableWrapper}>
             <table style={styles.table}>
@@ -129,10 +156,13 @@ function FileUpload(): JSX.Element {
                 </tr>
               </thead>
               <tbody>
-                {previewData.previewRows.map((row, rowIndex) => (
-                  <tr key={`row-${rowIndex}`}>
+                {pagedRows.map((row, rowIndex) => (
+                  <tr
+                    key={`row-${startIndex + rowIndex}`}
+                    style={row.isDuplicate ? styles.duplicateRow : undefined}
+                  >
                     {previewData.columns.map((column) => (
-                      <td key={`${column}-${rowIndex}`} style={styles.tableCell}>
+                      <td key={`${column}-${startIndex + rowIndex}`} style={styles.tableCell}>
                         {String(row[column] ?? '')}
                       </td>
                     ))}
@@ -142,9 +172,41 @@ function FileUpload(): JSX.Element {
             </table>
           </div>
 
+          {allRows.length > 0 && (
+            <div style={styles.paginationContainer}>
+              <button
+                type="button"
+                onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
+                disabled={currentPage === 1}
+                style={{
+                  ...styles.paginationButton,
+                  ...(currentPage === 1 ? styles.paginationButtonDisabled : {}),
+                }}
+              >
+                Previous
+              </button>
+
+              <p style={styles.paginationInfo}>
+                Page {currentPage} of {totalPages} · Rows {startIndex + 1}-{endIndex} of {allRows.length}
+              </p>
+
+              <button
+                type="button"
+                onClick={() => setCurrentPage((prev) => Math.min(totalPages, prev + 1))}
+                disabled={currentPage === totalPages}
+                style={{
+                  ...styles.paginationButton,
+                  ...(currentPage === totalPages ? styles.paginationButtonDisabled : {}),
+                }}
+              >
+                Next
+              </button>
+            </div>
+          )}
+
           {previewData.hasMoreRows && (
             <p style={styles.noteText}>
-              Showing the first 25 rows only.
+              Showing 25 rows per page.
             </p>
           )}
         </div>
@@ -216,6 +278,33 @@ const styles: Record<string, CSSProperties> = {
     width: '100%',
     marginTop: '1rem',
   },
+  summaryGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+    gap: '0.75rem',
+  },
+  summaryCard: {
+    border: '1px solid #e5e7eb',
+    borderRadius: '8px',
+    backgroundColor: '#f9fafb',
+    padding: '0.75rem',
+  },
+  summaryLabel: {
+    margin: 0,
+    fontSize: '0.8rem',
+    color: '#6b7280',
+    textAlign: 'left',
+  },
+  summaryValue: {
+    margin: '0.3rem 0 0',
+    fontSize: '1rem',
+    fontWeight: 700,
+    color: '#111827',
+    textAlign: 'left',
+  },
+  duplicateRow: {
+    backgroundColor: '#fff1f2',
+  },
   summaryText: {
     margin: 0,
     fontSize: '0.95rem',
@@ -262,6 +351,34 @@ const styles: Record<string, CSSProperties> = {
     fontSize: '0.85rem',
     color: '#6b7280',
     textAlign: 'left',
+  },
+  paginationContainer: {
+    marginTop: '0.85rem',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '0.75rem',
+    flexWrap: 'wrap',
+  },
+  paginationButton: {
+    padding: '0.45rem 0.9rem',
+    border: '1px solid #d1d5db',
+    borderRadius: '6px',
+    backgroundColor: '#ffffff',
+    color: '#111827',
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  paginationButtonDisabled: {
+    color: '#9ca3af',
+    cursor: 'not-allowed',
+    backgroundColor: '#f9fafb',
+  },
+  paginationInfo: {
+    margin: 0,
+    color: '#4b5563',
+    fontSize: '0.9rem',
+    fontWeight: 500,
   },
 };
 

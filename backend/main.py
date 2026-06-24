@@ -76,8 +76,9 @@ async def upload_file(file: UploadFile = File(...)):
     duplicate_rows = int(duplicate_mask.sum())
     duplicate_groups_count = int(duplicate_groups.dropna().nunique())
 
-    # Return only a preview subset, including duplicate markers
+    # Return a preview subset and full processed rows for client-side pagination
     preview_rows = rows_with_flags.head(25).to_dict(orient="records")
+    all_rows = rows_with_flags.to_dict(orient="records")
     processing_time_seconds = round(perf_counter() - start_time, 4)
 
     return {
@@ -87,6 +88,7 @@ async def upload_file(file: UploadFile = File(...)):
         "duplicateRows": duplicate_rows,
         "duplicateGroups": duplicate_groups_count,
         "previewRows": preview_rows,
+        "allRows": all_rows,
         "hasMoreRows": total_rows > 25,
         "hasManyColumns": total_columns > 20,
         "processingTimeSeconds": processing_time_seconds,
