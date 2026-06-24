@@ -54,17 +54,38 @@ async def upload_file(file: UploadFile = File(...)):
     # Convert missing values (NaN) to empty strings for the preview response
     cleaned_dataframe = dataframe.fillna("")
 
-    # Build preview metadata without returning the full dataset
+    # Detect duplicate rows across the entire row (all columns)
+    duplicate_mask = cleaned_dataframe.duplicated(keep=False)
+
+    # Build duplicate group IDs for rows that share identical values
+    duplicate_groups = pd.Series([None] * len(cleaned_dataframe), index=cleaned_dataframe.index)
+    if len(cleaned_dataframe.columns) > 0:
+        group_codes = cleaned_dataframe.groupby(
+            list(cleaned_dataframe.columns), dropna=False, sort=False
+        ).ngroup() + 1
+        duplicate_groups.loc[duplicate_mask] = group_codes.loc[duplicate_mask].astype(int)
+
+    rows_with_flags = cleaned_dataframe.copy()
+    rows_with_flags["isDuplicate"] = duplicate_mask
+    rows_with_flags["duplicateGroup"] = duplicate_groups
+
+    # Build response metadata without returning the full dataset
     columns = [str(column) for column in cleaned_dataframe.columns.tolist()]
     total_rows = len(cleaned_dataframe)
     total_columns = len(columns)
-    preview_rows = cleaned_dataframe.head(25).to_dict(orient="records")
+    duplicate_rows = int(duplicate_mask.sum())
+    duplicate_groups_count = int(duplicate_groups.dropna().nunique())
+
+    # Return only a preview subset, including duplicate markers
+    preview_rows = rows_with_flags.head(25).to_dict(orient="records")
     processing_time_seconds = round(perf_counter() - start_time, 4)
 
     return {
         "columns": columns,
         "totalRows": total_rows,
         "totalColumns": total_columns,
+        "duplicateRows": duplicate_rows,
+        "duplicateGroups": duplicate_groups_count,
         "previewRows": preview_rows,
         "hasMoreRows": total_rows > 25,
         "hasManyColumns": total_columns > 20,
