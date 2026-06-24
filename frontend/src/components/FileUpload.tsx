@@ -8,23 +8,94 @@ interface UploadPreviewResponse {
   totalColumns: number;
   duplicateRows: number;
   duplicateGroups: number;
+  duplicateCheckColumns: string[];
   previewRows: PreviewRow[];
   allRows: PreviewRow[];
+  currentPage: number;
+  pageSize: number;
+  totalPages: number;
   hasMoreRows: boolean;
   hasManyColumns: boolean;
   processingTimeSeconds: number;
 }
 
 interface PreviewRow {
+  rowId: number;
   isDuplicate?: boolean;
   duplicateGroup?: number | null;
   [key: string]: string | number | boolean | null | undefined;
 }
 
+const PAGE_SIZE = 25;
+
+const normalizeValue = (value: unknown): string => {
+  if (value === null || value === undefined) {
+    return '';
+  }
+
+  return String(value).trim().toLowerCase();
+};
+
+const recomputeDuplicates = (
+  rows: PreviewRow[],
+  duplicateCheckColumns: string[],
+): {
+  updatedRows: PreviewRow[];
+  duplicateRows: number;
+  duplicateGroups: number;
+} => {
+  const keyCounts = new Map<string, number>();
+
+  for (const row of rows) {
+    const key = duplicateCheckColumns
+      .map((column) => normalizeValue(row[column]))
+      .join('||');
+
+    keyCounts.set(key, (keyCounts.get(key) ?? 0) + 1);
+  }
+
+  let nextGroupId = 1;
+  const keyToGroup = new Map<string, number>();
+
+  const updatedRows = rows.map((row) => {
+    const key = duplicateCheckColumns
+      .map((column) => normalizeValue(row[column]))
+      .join('||');
+
+    const isDuplicate = (keyCounts.get(key) ?? 0) > 1;
+    let duplicateGroup: number | null = null;
+
+    if (isDuplicate) {
+      if (!keyToGroup.has(key)) {
+        keyToGroup.set(key, nextGroupId);
+        nextGroupId += 1;
+      }
+      duplicateGroup = keyToGroup.get(key) ?? null;
+    }
+
+    return {
+      ...row,
+      isDuplicate,
+      duplicateGroup,
+    };
+  });
+
+  const duplicateRows = updatedRows.filter((row) => row.isDuplicate).length;
+  const duplicateGroups = new Set(
+    updatedRows
+      .map((row) => row.duplicateGroup)
+      .filter((value): value is number => typeof value === 'number'),
+  ).size;
+
+  return {
+    updatedRows,
+    duplicateRows,
+    duplicateGroups,
+  };
+};
+
 // FileUpload component — handles Excel file selection and upload
 function FileUpload(): JSX.Element {
-  const PAGE_SIZE = 25;
-
   // Track the selected file and UI messages
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
@@ -33,6 +104,7 @@ function FileUpload(): JSX.Element {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [previewData, setPreviewData] = useState<UploadPreviewResponse | null>(null);
   const [currentPage, setCurrentPage] = useState<number>(1);
+  const [selectedRowIds, setSelectedRowIds] = useState<number[]>([]);
 
   // Called whenever the user picks a file from the input
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>): void => {
@@ -44,10 +116,11 @@ function FileUpload(): JSX.Element {
     setErrorMessage(null);
     setPreviewData(null);
     setCurrentPage(1);
+    setSelectedRowIds([]);
   };
 
-  // Upload the selected file to the backend
-  const handleUpload = async (): Promise<void> => {
+  // Upload file and fetch processed rows
+  const uploadFile = async (): Promise<void> => {
     if (!selectedFile) {
       return;
     }
@@ -67,8 +140,9 @@ function FileUpload(): JSX.Element {
       });
 
       setPreviewData(response.data);
-      setSuccessMessage('File preview loaded successfully.');
       setCurrentPage(1);
+      setSelectedRowIds([]);
+      setSuccessMessage('File preview loaded successfully.');
     } catch (error: unknown) {
       if (axios.isAxiosError<{ detail?: string }>(error)) {
         const detail = error.response?.data?.detail;
@@ -86,11 +160,95 @@ function FileUpload(): JSX.Element {
     }
   };
 
+  // Upload the selected file to the backend
+  const handleUpload = async (): Promise<void> => {
+    await uploadFile();
+  };
+
+  // Toggle one row checkbox
+  const toggleRowSelection = (rowId: number): void => {
+    setSelectedRowIds((prev) =>
+      prev.includes(rowId) ? prev.filter((id) => id !== rowId) : [...prev, rowId],
+    );
+  };
+
+  // Remove selected rows and recompute duplicate flags/counts
+  const handleRemoveSelected = (): void => {
+    if (!previewData || selectedRowIds.length === 0) {
+      return;
+    }
+
+    const remainingRows = previewData.allRows.filter(
+      (row) => !selectedRowIds.includes(row.rowId),
+    );
+
+    const duplicateResult = recomputeDuplicates(
+      remainingRows,
+      previewData.duplicateCheckColumns,
+    );
+
+    setPreviewData({
+      ...previewData,
+      allRows: duplicateResult.updatedRows,
+      previewRows: duplicateResult.updatedRows.slice(0, PAGE_SIZE),
+      totalRows: duplicateResult.updatedRows.length,
+      duplicateRows: duplicateResult.duplicateRows,
+      duplicateGroups: duplicateResult.duplicateGroups,
+      totalPages: Math.max(1, Math.ceil(duplicateResult.updatedRows.length / PAGE_SIZE)),
+      currentPage: 1,
+      hasMoreRows: duplicateResult.updatedRows.length > PAGE_SIZE,
+    });
+
+    setCurrentPage(1);
+    setSelectedRowIds([]);
+    setSuccessMessage(`Removed ${selectedRowIds.length} record(s).`);
+  };
+
+  // Export remaining rows to .xlsx — xlsx is imported lazily to avoid blocking initial render
+  const handleExport = async (): Promise<void> => {
+    if (!previewData || previewData.allRows.length === 0) {
+      return;
+    }
+
+    const XLSX = await import('xlsx');
+
+    const exportRows = previewData.allRows.map((row) => {
+      const exportRow: Record<string, string | number | boolean | null | undefined> = {};
+
+      for (const column of previewData.columns) {
+        exportRow[column] = row[column] ?? '';
+      }
+
+      return exportRow;
+    });
+
+    const worksheet = XLSX.utils.json_to_sheet(exportRows, { header: previewData.columns });
+    const workbook = XLSX.utils.book_new();
+
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Remaining Records');
+    XLSX.writeFile(workbook, 'remaining_records.xlsx');
+  };
+
   const allRows = previewData?.allRows ?? [];
   const totalPages = Math.max(1, Math.ceil(allRows.length / PAGE_SIZE));
-  const startIndex = (currentPage - 1) * PAGE_SIZE;
-  const endIndex = Math.min(startIndex + PAGE_SIZE, allRows.length);
+  const safeCurrentPage = Math.min(currentPage, totalPages);
+  const startIndex = (safeCurrentPage - 1) * PAGE_SIZE;
+  const endIndex = startIndex + PAGE_SIZE;
   const pagedRows = allRows.slice(startIndex, endIndex);
+
+  const allRowsOnPageSelected =
+    pagedRows.length > 0 && pagedRows.every((row) => selectedRowIds.includes(row.rowId));
+
+  const toggleSelectAllOnPage = (): void => {
+    const pageIds = pagedRows.map((row) => row.rowId);
+
+    if (allRowsOnPageSelected) {
+      setSelectedRowIds((prev) => prev.filter((id) => !pageIds.includes(id)));
+      return;
+    }
+
+    setSelectedRowIds((prev) => Array.from(new Set([...prev, ...pageIds])));
+  };
 
   return (
     <div style={styles.container}>
@@ -144,10 +302,43 @@ function FileUpload(): JSX.Element {
             </div>
           </div>
 
+          <div style={styles.actionsRow}>
+            <button
+              type="button"
+              onClick={handleRemoveSelected}
+              disabled={selectedRowIds.length === 0}
+              style={{
+                ...styles.removeButton,
+                ...(selectedRowIds.length === 0 ? styles.removeButtonDisabled : {}),
+              }}
+            >
+              Remove checked ({selectedRowIds.length})
+            </button>
+
+            <button
+              type="button"
+              onClick={handleExport}
+              disabled={allRows.length === 0}
+              style={{
+                ...styles.exportButton,
+                ...(allRows.length === 0 ? styles.exportButtonDisabled : {}),
+              }}
+            >
+              Export remaining (.xlsx)
+            </button>
+          </div>
+
           <div style={styles.tableWrapper}>
             <table style={styles.table}>
               <thead>
                 <tr>
+                  <th style={styles.tableHeaderCheckbox}>
+                    <input
+                      type="checkbox"
+                      checked={allRowsOnPageSelected}
+                      onChange={toggleSelectAllOnPage}
+                    />
+                  </th>
                   {previewData.columns.map((column) => (
                     <th key={column} style={styles.tableHeader}>
                       {column}
@@ -158,11 +349,18 @@ function FileUpload(): JSX.Element {
               <tbody>
                 {pagedRows.map((row, rowIndex) => (
                   <tr
-                    key={`row-${startIndex + rowIndex}`}
+                    key={`row-${row.rowId}`}
                     style={row.isDuplicate ? styles.duplicateRow : undefined}
                   >
+                    <td style={styles.tableCellCheckbox}>
+                      <input
+                        type="checkbox"
+                        checked={selectedRowIds.includes(row.rowId)}
+                        onChange={() => toggleRowSelection(row.rowId)}
+                      />
+                    </td>
                     {previewData.columns.map((column) => (
-                      <td key={`${column}-${startIndex + rowIndex}`} style={styles.tableCell}>
+                      <td key={`${column}-${row.rowId}-${rowIndex}`} style={styles.tableCell}>
                         {String(row[column] ?? '')}
                       </td>
                     ))}
@@ -172,39 +370,45 @@ function FileUpload(): JSX.Element {
             </table>
           </div>
 
-          {allRows.length > 0 && (
-            <div style={styles.paginationContainer}>
-              <button
-                type="button"
-                onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
-                disabled={currentPage === 1}
-                style={{
-                  ...styles.paginationButton,
-                  ...(currentPage === 1 ? styles.paginationButtonDisabled : {}),
-                }}
-              >
-                Previous
-              </button>
+          <div style={styles.paginationContainer}>
+            <button
+              type="button"
+              disabled={isUploading || safeCurrentPage <= 1}
+              onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
+              style={{
+                ...styles.paginationButton,
+                ...((isUploading || safeCurrentPage <= 1)
+                  ? styles.paginationButtonDisabled
+                  : {}),
+              }}
+            >
+              Previous
+            </button>
 
-              <p style={styles.paginationInfo}>
-                Page {currentPage} of {totalPages} · Rows {startIndex + 1}-{endIndex} of {allRows.length}
-              </p>
+            <p style={styles.paginationText}>
+              Page {safeCurrentPage} of {totalPages}
+            </p>
 
-              <button
-                type="button"
-                onClick={() => setCurrentPage((prev) => Math.min(totalPages, prev + 1))}
-                disabled={currentPage === totalPages}
-                style={{
-                  ...styles.paginationButton,
-                  ...(currentPage === totalPages ? styles.paginationButtonDisabled : {}),
-                }}
-              >
-                Next
-              </button>
-            </div>
-          )}
+            <button
+              type="button"
+              disabled={isUploading || safeCurrentPage >= totalPages}
+              onClick={() => setCurrentPage((prev) => Math.min(totalPages, prev + 1))}
+              style={{
+                ...styles.paginationButton,
+                ...((isUploading || safeCurrentPage >= totalPages)
+                  ? styles.paginationButtonDisabled
+                  : {}),
+              }}
+            >
+              Next
+            </button>
+          </div>
 
-          {previewData.hasMoreRows && (
+          <p style={styles.duplicateRuleText}>
+            Duplicates are checked using First Name, Last Name, and Email.
+          </p>
+
+          {totalPages > 1 && (
             <p style={styles.noteText}>
               Showing 25 rows per page.
             </p>
@@ -338,6 +542,16 @@ const styles: Record<string, CSSProperties> = {
     position: 'sticky',
     top: 0,
   },
+  tableHeaderCheckbox: {
+    width: '44px',
+    minWidth: '44px',
+    padding: '0.75rem 0.5rem',
+    borderBottom: '1px solid #d1d5db',
+    backgroundColor: '#f3f4f6',
+    textAlign: 'center',
+    position: 'sticky',
+    top: 0,
+  },
   tableCell: {
     padding: '0.75rem',
     borderBottom: '1px solid #e5e7eb',
@@ -346,39 +560,87 @@ const styles: Record<string, CSSProperties> = {
     color: '#374151',
     whiteSpace: 'nowrap',
   },
+  tableCellCheckbox: {
+    width: '44px',
+    minWidth: '44px',
+    textAlign: 'center',
+    borderBottom: '1px solid #e5e7eb',
+    padding: '0.75rem 0.5rem',
+  },
   noteText: {
     margin: '0.75rem 0 0',
     fontSize: '0.85rem',
     color: '#6b7280',
     textAlign: 'left',
   },
-  paginationContainer: {
-    marginTop: '0.85rem',
+  duplicateRuleText: {
+    margin: '0.75rem 0 0',
+    fontSize: '0.85rem',
+    color: '#374151',
+    textAlign: 'left',
+  },
+  actionsRow: {
+    marginTop: '0.75rem',
     display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'space-between',
     gap: '0.75rem',
     flexWrap: 'wrap',
+    justifyContent: 'flex-start',
   },
-  paginationButton: {
-    padding: '0.45rem 0.9rem',
-    border: '1px solid #d1d5db',
+  removeButton: {
+    border: 'none',
+    backgroundColor: '#dc2626',
+    color: '#ffffff',
     borderRadius: '6px',
-    backgroundColor: '#ffffff',
-    color: '#111827',
+    padding: '0.5rem 1rem',
+    fontSize: '0.85rem',
     fontWeight: 600,
     cursor: 'pointer',
   },
-  paginationButtonDisabled: {
-    color: '#9ca3af',
+  removeButtonDisabled: {
+    backgroundColor: '#fca5a5',
     cursor: 'not-allowed',
-    backgroundColor: '#f9fafb',
   },
-  paginationInfo: {
+  exportButton: {
+    border: 'none',
+    backgroundColor: '#2563eb',
+    color: '#ffffff',
+    borderRadius: '6px',
+    padding: '0.5rem 1rem',
+    fontSize: '0.85rem',
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  exportButtonDisabled: {
+    backgroundColor: '#93c5fd',
+    cursor: 'not-allowed',
+  },
+  paginationContainer: {
+    marginTop: '0.75rem',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: '0.75rem',
+  },
+  paginationButton: {
+    border: '1px solid #d1d5db',
+    backgroundColor: '#ffffff',
+    borderRadius: '6px',
+    padding: '0.4rem 0.9rem',
+    fontSize: '0.85rem',
+    fontWeight: 600,
+    color: '#111827',
+    cursor: 'pointer',
+  },
+  paginationButtonDisabled: {
+    cursor: 'not-allowed',
+    color: '#9ca3af',
+    backgroundColor: '#f3f4f6',
+  },
+  paginationText: {
     margin: 0,
-    color: '#4b5563',
-    fontSize: '0.9rem',
-    fontWeight: 500,
+    fontSize: '0.85rem',
+    color: '#374151',
+    fontWeight: 600,
   },
 };
 

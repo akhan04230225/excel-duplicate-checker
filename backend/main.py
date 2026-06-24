@@ -3,7 +3,7 @@ from io import BytesIO
 from time import perf_counter
 
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 # Create the FastAPI app instance
@@ -26,7 +26,11 @@ def root():
 
 # Upload endpoint — accepts one Excel file and validates its extension
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(
+    file: UploadFile = File(...),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=200),
+):
     # Track processing time for the preview response
     start_time = perf_counter()
 
@@ -51,21 +55,41 @@ async def upload_file(file: UploadFile = File(...)):
             detail="Unable to read Excel file. Please upload a valid .xlsx or .xls file.",
         ) from exc
 
+    # Duplicate detection is based only on these columns
+    duplicate_check_columns = ["First Name", "Last Name", "Email"]
+
+    # Validate required columns before processing
+    missing_columns = [
+        column for column in duplicate_check_columns if column not in dataframe.columns
+    ]
+    if missing_columns:
+        missing_text = ", ".join(missing_columns)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing required columns: {missing_text}",
+        )
+
     # Convert missing values (NaN) to empty strings for the preview response
     cleaned_dataframe = dataframe.fillna("")
 
-    # Detect duplicate rows across the entire row (all columns)
-    duplicate_mask = cleaned_dataframe.duplicated(keep=False)
+    # Normalize only duplicate-check columns for consistent comparison
+    normalized_keys = cleaned_dataframe[duplicate_check_columns].apply(
+        lambda series: series.fillna("").astype(str).str.strip().str.lower()
+    )
 
-    # Build duplicate group IDs for rows that share identical values
+    # Mark rows as duplicates when another row shares the same normalized key
+    duplicate_mask = normalized_keys.duplicated(keep=False)
+
+    # Build duplicate group IDs for rows that share identical normalized keys
     duplicate_groups = pd.Series([None] * len(cleaned_dataframe), index=cleaned_dataframe.index)
-    if len(cleaned_dataframe.columns) > 0:
-        group_codes = cleaned_dataframe.groupby(
-            list(cleaned_dataframe.columns), dropna=False, sort=False
+    if len(cleaned_dataframe) > 0:
+        group_codes = normalized_keys.groupby(
+            duplicate_check_columns, dropna=False, sort=False
         ).ngroup() + 1
         duplicate_groups.loc[duplicate_mask] = group_codes.loc[duplicate_mask].astype(int)
 
     rows_with_flags = cleaned_dataframe.copy()
+    rows_with_flags["rowId"] = rows_with_flags.index + 1
     rows_with_flags["isDuplicate"] = duplicate_mask
     rows_with_flags["duplicateGroup"] = duplicate_groups
 
@@ -76,8 +100,12 @@ async def upload_file(file: UploadFile = File(...)):
     duplicate_rows = int(duplicate_mask.sum())
     duplicate_groups_count = int(duplicate_groups.dropna().nunique())
 
-    # Return a preview subset and full processed rows for client-side pagination
-    preview_rows = rows_with_flags.head(25).to_dict(orient="records")
+    # Return only one page of rows for performance
+    total_pages = max(1, (total_rows + page_size - 1) // page_size)
+    current_page = min(page, total_pages)
+    start_index = (current_page - 1) * page_size
+    end_index = start_index + page_size
+    preview_rows = rows_with_flags.iloc[start_index:end_index].to_dict(orient="records")
     all_rows = rows_with_flags.to_dict(orient="records")
     processing_time_seconds = round(perf_counter() - start_time, 4)
 
@@ -87,9 +115,13 @@ async def upload_file(file: UploadFile = File(...)):
         "totalColumns": total_columns,
         "duplicateRows": duplicate_rows,
         "duplicateGroups": duplicate_groups_count,
+        "duplicateCheckColumns": duplicate_check_columns,
         "previewRows": preview_rows,
         "allRows": all_rows,
-        "hasMoreRows": total_rows > 25,
+        "currentPage": current_page,
+        "pageSize": page_size,
+        "totalPages": total_pages,
+        "hasMoreRows": end_index < total_rows,
         "hasManyColumns": total_columns > 20,
         "processingTimeSeconds": processing_time_seconds,
     }
