@@ -1,8 +1,16 @@
-function App() {
+import './App.css';
+
+// Root application component
+function App(): JSX.Element {
   return (
-    <div style={{ padding: "2rem" }}>
-      <h1>Excel Duplicate Checker</h1>
-      <p>Upload an Excel file to find duplicate records.</p>
+    <div className="app-container">
+      {/* Page title */}
+      <h1 className="app-title">Excel Duplicate Checker</h1>
+
+      {/* Page subtitle */}
+      <p className="app-subtitle">
+        Upload an Excel file to find duplicate records.
+      </p>
     </div>
   );
 }
