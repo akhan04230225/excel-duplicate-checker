@@ -2,6 +2,20 @@ import axios from 'axios';
 import { useState } from 'react';
 import type { ChangeEvent, CSSProperties, JSX } from 'react';
 
+interface UploadPreviewResponse {
+  columns: string[];
+  totalRows: number;
+  totalColumns: number;
+  previewRows: PreviewRow[];
+  hasMoreRows: boolean;
+  hasManyColumns: boolean;
+  processingTimeSeconds: number;
+}
+
+interface PreviewRow {
+  [key: string]: string | number | boolean | null;
+}
+
 // FileUpload component — handles Excel file selection and upload
 function FileUpload(): JSX.Element {
   // Track the selected file and UI messages
@@ -10,6 +24,7 @@ function FileUpload(): JSX.Element {
   const [isUploading, setIsUploading] = useState<boolean>(false);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [previewData, setPreviewData] = useState<UploadPreviewResponse | null>(null);
 
   // Called whenever the user picks a file from the input
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>): void => {
@@ -19,6 +34,7 @@ function FileUpload(): JSX.Element {
     setFileName(file ? file.name : null);
     setSuccessMessage(null);
     setErrorMessage(null);
+    setPreviewData(null);
   };
 
   // Upload the selected file to the backend
@@ -35,17 +51,14 @@ function FileUpload(): JSX.Element {
     setErrorMessage(null);
 
     try {
-      const response = await axios.post<{ filename: string; content_type: string | null }>(
-        'http://localhost:8000/upload',
-        formData,
-        {
-          headers: {
-            'Content-Type': 'multipart/form-data',
-          },
+      const response = await axios.post<UploadPreviewResponse>('http://localhost:8000/upload', formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data',
         },
-      );
+      });
 
-      setSuccessMessage(`Upload successful: ${response.data.filename}`);
+      setPreviewData(response.data);
+      setSuccessMessage('File preview loaded successfully.');
     } catch (error: unknown) {
       if (axios.isAxiosError<{ detail?: string }>(error)) {
         const detail = error.response?.data?.detail;
@@ -53,8 +66,10 @@ function FileUpload(): JSX.Element {
           typeof detail === 'string' ? detail : 'Upload failed. Please try again.';
 
         setErrorMessage(message);
+        setPreviewData(null);
       } else {
         setErrorMessage('Upload failed. Please try again.');
+        setPreviewData(null);
       }
     } finally {
       setIsUploading(false);
@@ -95,6 +110,45 @@ function FileUpload(): JSX.Element {
 
       {successMessage && <p style={styles.successMessage}>{successMessage}</p>}
       {errorMessage && <p style={styles.errorMessage}>{errorMessage}</p>}
+
+      {previewData && (
+        <div style={styles.previewSection}>
+          <p style={styles.summaryText}>
+            Total rows: {previewData.totalRows}
+          </p>
+
+          <div style={styles.tableWrapper}>
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  {previewData.columns.map((column) => (
+                    <th key={column} style={styles.tableHeader}>
+                      {column}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {previewData.previewRows.map((row, rowIndex) => (
+                  <tr key={`row-${rowIndex}`}>
+                    {previewData.columns.map((column) => (
+                      <td key={`${column}-${rowIndex}`} style={styles.tableCell}>
+                        {String(row[column] ?? '')}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {previewData.hasMoreRows && (
+            <p style={styles.noteText}>
+              Showing the first 25 rows only.
+            </p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -111,7 +165,7 @@ const styles: Record<string, CSSProperties> = {
     border: '2px dashed #ccc',
     borderRadius: '8px',
     width: '100%',
-    maxWidth: '400px',
+    maxWidth: '1100px',
   },
   label: {
     display: 'inline-block',
@@ -157,6 +211,57 @@ const styles: Record<string, CSSProperties> = {
     color: '#dc2626',
     margin: 0,
     textAlign: 'center',
+  },
+  previewSection: {
+    width: '100%',
+    marginTop: '1rem',
+  },
+  summaryText: {
+    margin: 0,
+    fontSize: '0.95rem',
+    fontWeight: 600,
+    color: '#111827',
+    textAlign: 'left',
+  },
+  tableWrapper: {
+    width: '100%',
+    overflowX: 'auto',
+    overflowY: 'auto',
+    maxHeight: '420px',
+    border: '1px solid #d1d5db',
+    borderRadius: '8px',
+    marginTop: '0.75rem',
+  },
+  table: {
+    width: '100%',
+    borderCollapse: 'collapse',
+    minWidth: '700px',
+    backgroundColor: '#ffffff',
+  },
+  tableHeader: {
+    padding: '0.75rem',
+    borderBottom: '1px solid #d1d5db',
+    backgroundColor: '#f3f4f6',
+    textAlign: 'left',
+    fontSize: '0.9rem',
+    fontWeight: 700,
+    color: '#111827',
+    position: 'sticky',
+    top: 0,
+  },
+  tableCell: {
+    padding: '0.75rem',
+    borderBottom: '1px solid #e5e7eb',
+    textAlign: 'left',
+    fontSize: '0.9rem',
+    color: '#374151',
+    whiteSpace: 'nowrap',
+  },
+  noteText: {
+    margin: '0.75rem 0 0',
+    fontSize: '0.85rem',
+    color: '#6b7280',
+    textAlign: 'left',
   },
 };
 
