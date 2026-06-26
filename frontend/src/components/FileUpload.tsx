@@ -42,6 +42,80 @@ interface WorkbookState {
 
 const PAGE_SIZE = 25;
 
+const NAME_COLUMNS_BY_SHEET: Record<SheetKey, string[]> = {
+  guestData: ['guest first and last name'],
+  richmondLocals: ['first name', 'last name'],
+};
+
+const PHONE_COLUMN_BY_SHEET: Record<SheetKey, string[]> = {
+  guestData: ['guest phone number'],
+  richmondLocals: [],
+};
+
+const STATE_COLUMN_BY_SHEET: Record<SheetKey, string[]> = {
+  guestData: ['state'],
+  richmondLocals: [],
+};
+
+const CITY_COLUMN_BY_SHEET: Record<SheetKey, string[]> = {
+  guestData: ['city'],
+  richmondLocals: [],
+};
+
+const US_STATE_NAME_TO_CODE: Record<string, string> = {
+  alabama: 'AL',
+  alaska: 'AK',
+  arizona: 'AZ',
+  arkansas: 'AR',
+  california: 'CA',
+  colorado: 'CO',
+  connecticut: 'CT',
+  delaware: 'DE',
+  florida: 'FL',
+  georgia: 'GA',
+  hawaii: 'HI',
+  idaho: 'ID',
+  illinois: 'IL',
+  indiana: 'IN',
+  iowa: 'IA',
+  kansas: 'KS',
+  kentucky: 'KY',
+  louisiana: 'LA',
+  maine: 'ME',
+  maryland: 'MD',
+  massachusetts: 'MA',
+  michigan: 'MI',
+  minnesota: 'MN',
+  mississippi: 'MS',
+  missouri: 'MO',
+  montana: 'MT',
+  nebraska: 'NE',
+  nevada: 'NV',
+  'new hampshire': 'NH',
+  'new jersey': 'NJ',
+  'new mexico': 'NM',
+  'new york': 'NY',
+  'north carolina': 'NC',
+  'north dakota': 'ND',
+  ohio: 'OH',
+  oklahoma: 'OK',
+  oregon: 'OR',
+  pennsylvania: 'PA',
+  'rhode island': 'RI',
+  'south carolina': 'SC',
+  'south dakota': 'SD',
+  tennessee: 'TN',
+  texas: 'TX',
+  utah: 'UT',
+  vermont: 'VT',
+  virginia: 'VA',
+  washington: 'WA',
+  'west virginia': 'WV',
+  wisconsin: 'WI',
+  wyoming: 'WY',
+  'district of columbia': 'DC',
+};
+
 const normalizeValue = (value: unknown): string => {
   if (value === null || value === undefined) {
     return '';
@@ -49,6 +123,125 @@ const normalizeValue = (value: unknown): string => {
 
   return String(value).trim().toLowerCase();
 };
+
+const toTitleCase = (value: string): string =>
+  value
+    .toLowerCase()
+    .replace(/\b([a-z])/g, (letter) => letter.toUpperCase());
+
+const capitalizeFirstOnly = (value: string): string => {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  return trimmed.charAt(0).toUpperCase() + trimmed.slice(1).toLowerCase();
+};
+
+const toPhoneFormat = (value: string): string => {
+  const digits = value.replace(/\D/g, '');
+
+  if (digits.length === 10) {
+    return `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6, 10)}`;
+  }
+
+  if (digits.length === 11 && digits.startsWith('1')) {
+    const local = digits.slice(1);
+    return `${local.slice(0, 3)}-${local.slice(3, 6)}-${local.slice(6, 10)}`;
+  }
+
+  return value;
+};
+
+const toStateCode = (value: string): string => {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  const normalized = trimmed.toLowerCase();
+
+  if (US_STATE_NAME_TO_CODE[normalized]) {
+    return US_STATE_NAME_TO_CODE[normalized];
+  }
+
+  if (/^[a-z]{2}$/i.test(trimmed)) {
+    return trimmed.toUpperCase();
+  }
+
+  return trimmed;
+};
+
+const isValidEmail = (value: string): boolean => {
+  const email = value.trim().toLowerCase();
+
+  // Basic structure checks
+  if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i.test(email)) {
+    return false;
+  }
+
+  const [, domain = ''] = email.split('@');
+
+  // Domain labels must be non-empty and cannot start/end with '-'
+  const labels = domain.split('.');
+  if (labels.some((label) => label.length === 0 || label.startsWith('-') || label.endsWith('-'))) {
+    return false;
+  }
+
+  // Catch common malformed Gmail typos observed in data
+  if (/^gmai\.(co|com)$/i.test(domain) || /^gmal(com|\.com)$/i.test(domain)) {
+    return false;
+  }
+
+  return true;
+};
+
+const hasInvalidGuestEmail = (sheetKey: SheetKey, row: TableRow): boolean => {
+  if (sheetKey !== 'guestData') {
+    return false;
+  }
+
+  const email = String(row['Guest Email'] ?? '').trim();
+  return email.length > 0 && !isValidEmail(email);
+};
+
+const formatCellValue = (sheetKey: SheetKey, column: string, value: unknown): string => {
+  const raw = value === null || value === undefined ? '' : String(value);
+  const normalizedColumn = column.trim().toLowerCase();
+
+  if (NAME_COLUMNS_BY_SHEET[sheetKey].includes(normalizedColumn)) {
+    return toTitleCase(raw.trim());
+  }
+
+  if (PHONE_COLUMN_BY_SHEET[sheetKey].includes(normalizedColumn)) {
+    return toPhoneFormat(raw.trim());
+  }
+
+  if (STATE_COLUMN_BY_SHEET[sheetKey].includes(normalizedColumn)) {
+    return toStateCode(raw);
+  }
+
+  if (CITY_COLUMN_BY_SHEET[sheetKey].includes(normalizedColumn)) {
+    return capitalizeFirstOnly(raw);
+  }
+
+  return raw;
+};
+
+const applySheetFormattingToRows = (sheetKey: SheetKey, rows: TableRow[]): TableRow[] =>
+  rows.map((row) => {
+    const formattedRow: TableRow = { ...row };
+
+    for (const [column, value] of Object.entries(row)) {
+      if (column === 'rowId' || column === 'isDuplicate' || column === 'duplicateGroup') {
+        continue;
+      }
+
+      formattedRow[column] = formatCellValue(sheetKey, column, value);
+    }
+
+    return formattedRow;
+  });
 
 const summarizeDuplicates = (
   rows: TableRow[],
@@ -162,7 +355,7 @@ const detectRichmondDuplicates = (rows: TableRow[]): TableRow[] => {
 };
 
 const rebuildGuestSheet = (rows: TableRow[], deletedRows = 0): SheetState => {
-  const duplicatedRows = detectGuestDuplicates(rows);
+  const duplicatedRows = applySheetFormattingToRows('guestData', detectGuestDuplicates(rows));
   const summary = summarizeDuplicates(duplicatedRows);
 
   return {
@@ -189,7 +382,7 @@ const rebuildGuestSheet = (rows: TableRow[], deletedRows = 0): SheetState => {
 };
 
 const rebuildRichmondSheet = (rows: TableRow[], deletedRows = 0): SheetState => {
-  const duplicatedRows = detectRichmondDuplicates(rows);
+  const duplicatedRows = applySheetFormattingToRows('richmondLocals', detectRichmondDuplicates(rows));
   const summary = summarizeDuplicates(duplicatedRows);
 
   return {
@@ -214,6 +407,7 @@ function FileUpload(): JSX.Element {
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [workbookData, setWorkbookData] = useState<WorkbookState | null>(null);
+  const [guestEmailDrafts, setGuestEmailDrafts] = useState<Record<number, string>>({});
 
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>): void => {
     const file = e.target.files?.[0] ?? null;
@@ -222,6 +416,7 @@ function FileUpload(): JSX.Element {
     setSuccessMessage(null);
     setErrorMessage(null);
     setWorkbookData(null);
+    setGuestEmailDrafts({});
   };
 
   const uploadFile = async (): Promise<void> => {
@@ -243,23 +438,15 @@ function FileUpload(): JSX.Element {
         },
       });
 
+      const initialGuestSheet = rebuildGuestSheet(response.data.guestData.rows as TableRow[]);
+      const initialRichmondSheet = rebuildRichmondSheet(response.data.richmondLocals.rows as TableRow[]);
+
       setWorkbookData({
-        guestData: {
-          ...response.data.guestData,
-          currentPage: 1,
-          pageSize: PAGE_SIZE,
-          selectedRowIds: [],
-          deletedRows: 0,
-        },
-        richmondLocals: {
-          ...response.data.richmondLocals,
-          currentPage: 1,
-          pageSize: PAGE_SIZE,
-          selectedRowIds: [],
-          deletedRows: 0,
-        },
+        guestData: initialGuestSheet,
+        richmondLocals: initialRichmondSheet,
         processingTimeSeconds: response.data.processingTimeSeconds,
       });
+      setGuestEmailDrafts({});
 
       setSuccessMessage('Workbook loaded successfully.');
     } catch (error: unknown) {
@@ -324,6 +511,49 @@ function FileUpload(): JSX.Element {
           ? sheet.selectedRowIds.filter((rowId) => !pageRowIds.includes(rowId))
           : Array.from(new Set([...sheet.selectedRowIds, ...pageRowIds])),
       };
+    });
+  };
+
+  const handleGuestEmailDraftChange = (rowId: number, value: string): void => {
+    setGuestEmailDrafts((prev) => ({
+      ...prev,
+      [rowId]: value,
+    }));
+  };
+
+  const handleSaveGuestEmail = (rowId: number, currentEmail: string): void => {
+    const draft = guestEmailDrafts[rowId];
+    if (typeof draft !== 'string') {
+      return;
+    }
+
+    const nextEmail = draft.trim();
+    if (nextEmail === currentEmail.trim()) {
+      return;
+    }
+
+    updateSheet('guestData', (sheet) => {
+      const updatedRows = sheet.rows.map((row) =>
+        row.rowId === rowId
+          ? {
+              ...row,
+              'Guest Email': nextEmail,
+            }
+          : row,
+      );
+
+      const rebuilt = rebuildGuestSheet(updatedRows, sheet.deletedRows);
+      return {
+        ...rebuilt,
+        currentPage: sheet.currentPage,
+        selectedRowIds: sheet.selectedRowIds,
+      };
+    });
+
+    setGuestEmailDrafts((prev) => {
+      const updated = { ...prev };
+      delete updated[rowId];
+      return updated;
     });
   };
 
@@ -426,7 +656,16 @@ function FileUpload(): JSX.Element {
             </thead>
             <tbody>
               {pageRows.map((row) => (
-                <tr key={`${sheetKey}-${row.rowId}`} style={row.isDuplicate ? styles.duplicateRow : undefined}>
+                <tr
+                  key={`${sheetKey}-${row.rowId}`}
+                  style={
+                    hasInvalidGuestEmail(sheetKey, row)
+                      ? styles.invalidEmailRow
+                      : row.isDuplicate
+                        ? styles.duplicateRow
+                        : undefined
+                  }
+                >
                   <td style={styles.checkboxCell}>
                     <input
                       type="checkbox"
@@ -436,7 +675,25 @@ function FileUpload(): JSX.Element {
                   </td>
                   {sheet.columns.map((column) => (
                     <td key={`${sheetKey}-${row.rowId}-${column}`} style={styles.tableCell}>
-                      {String(row[column] ?? '')}
+                      {sheetKey === 'guestData' && column.trim().toLowerCase() === 'guest email' && hasInvalidGuestEmail(sheetKey, row) ? (
+                        <div style={styles.invalidEmailEditContainer}>
+                          <input
+                            type="text"
+                            value={guestEmailDrafts[row.rowId] ?? String(row['Guest Email'] ?? '')}
+                            onChange={(e) => handleGuestEmailDraftChange(row.rowId, e.target.value)}
+                            style={styles.invalidEmailInput}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleSaveGuestEmail(row.rowId, String(row['Guest Email'] ?? ''))}
+                            style={styles.invalidEmailSaveButton}
+                          >
+                            Save
+                          </button>
+                        </div>
+                      ) : (
+                        formatCellValue(sheetKey, column, row[column])
+                      )}
                     </td>
                   ))}
                 </tr>
@@ -777,6 +1034,35 @@ const styles: Record<string, CSSProperties> = {
   },
   duplicateRow: {
     backgroundColor: '#fff1f2',
+  },
+  invalidEmailRow: {
+    backgroundColor: 'rgba(255, 0, 0, 0.12)',
+  },
+  invalidEmailEditContainer: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.4rem',
+    minWidth: '260px',
+  },
+  invalidEmailInput: {
+    flex: 1,
+    minWidth: '180px',
+    border: '1px solid #fca5a5',
+    borderRadius: '6px',
+    padding: '0.35rem 0.45rem',
+    fontSize: '0.85rem',
+    color: '#111827',
+    backgroundColor: '#fff',
+  },
+  invalidEmailSaveButton: {
+    border: 'none',
+    borderRadius: '6px',
+    padding: '0.35rem 0.55rem',
+    backgroundColor: '#b91c1c',
+    color: '#fff',
+    fontSize: '0.8rem',
+    fontWeight: 600,
+    cursor: 'pointer',
   },
   paginationRow: {
     marginTop: '0.75rem',
