@@ -1,127 +1,253 @@
-# Import FastAPI framework and CORS middleware
 from io import BytesIO
 from time import perf_counter
 
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-# Create the FastAPI app instance
 app = FastAPI()
 
-# Allow requests from the Vite dev server (React frontend)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Frontend origin
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
-    allow_methods=["*"],   # Allow all HTTP methods
-    allow_headers=["*"],   # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Health-check endpoint — returns a simple status message
+GUEST_SHEET = "Guest Data"
+RICHMOND_SHEET = "Richmond Locals"
+
+GUEST_COLUMNS = [
+    "Order #",
+    "Guest First and Last Name",
+    "Guest Gender",
+    "Guest Email",
+    "Guest Phone Number",
+    "City",
+    "State",
+]
+
+GUEST_DUPLICATE_COLUMNS = [
+    "Order #",
+    "Guest First and Last Name",
+    "Guest Email",
+]
+
+RICHMOND_COLUMNS = ["First Name", "Last Name", "Email Address"]
+RICHMOND_DUPLICATE_COLUMNS = ["First Name", "Last Name", "Email Address"]
+
+
+def normalize_value(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().lower()
+
+
+def validate_columns(dataframe: pd.DataFrame, required_columns: list[str], sheet_name: str) -> None:
+    missing_columns = [column for column in required_columns if column not in dataframe.columns]
+    if missing_columns:
+        missing_text = ", ".join(missing_columns)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing required columns in {sheet_name}: {missing_text}",
+        )
+
+
+def build_sheet_rows(
+    dataframe: pd.DataFrame,
+    display_columns: list[str],
+    duplicate_rule,
+) -> tuple[list[dict[str, object]], int, int]:
+    cleaned = dataframe.fillna("")
+    display_frame = cleaned[display_columns].copy()
+
+    duplicate_mask, duplicate_groups = duplicate_rule(display_frame)
+
+    rows = display_frame.to_dict(orient="records")
+    total_duplicate_rows = 0
+    duplicate_group_ids = set()
+
+    for index, row in enumerate(rows):
+        row["rowId"] = index + 1
+        row["isDuplicate"] = bool(duplicate_mask[index])
+        duplicate_group = duplicate_groups[index]
+        row["duplicateGroup"] = duplicate_group
+        if row["isDuplicate"]:
+            total_duplicate_rows += 1
+        if duplicate_group is not None:
+            duplicate_group_ids.add(duplicate_group)
+
+    return rows, total_duplicate_rows, len(duplicate_group_ids)
+
+
+def detect_guest_duplicates(dataframe: pd.DataFrame) -> tuple[list[bool], list[int | None]]:
+    order_counts: dict[tuple[str, str], int] = {}
+    email_counts: dict[tuple[str, str], int] = {}
+
+    normalized_rows = []
+    for _, row in dataframe.iterrows():
+        order_value = normalize_value(row["Order #"])
+        name_value = normalize_value(row["Guest First and Last Name"])
+        email_value = normalize_value(row["Guest Email"])
+        normalized_rows.append((order_value, name_value, email_value))
+
+        if order_value:
+            order_key = (order_value, name_value)
+            order_counts[order_key] = order_counts.get(order_key, 0) + 1
+
+        if email_value:
+            email_key = (email_value, name_value)
+            email_counts[email_key] = email_counts.get(email_key, 0) + 1
+
+    duplicate_mask: list[bool] = []
+    duplicate_groups: list[int | None] = []
+    order_group_ids: dict[tuple[str, str], int] = {}
+    email_group_ids: dict[tuple[str, str], int] = {}
+    next_group_id = 1
+
+    for order_value, name_value, email_value in normalized_rows:
+        order_key = (order_value, name_value)
+        email_key = (email_value, name_value)
+
+        is_order_duplicate = bool(order_value) and order_counts.get(order_key, 0) > 1
+        is_email_duplicate = bool(email_value) and email_counts.get(email_key, 0) > 1
+        is_duplicate = is_order_duplicate or is_email_duplicate
+
+        group_id: int | None = None
+        if is_order_duplicate:
+            if order_key not in order_group_ids:
+                order_group_ids[order_key] = next_group_id
+                next_group_id += 1
+            group_id = order_group_ids[order_key]
+        elif is_email_duplicate:
+            if email_key not in email_group_ids:
+                email_group_ids[email_key] = next_group_id
+                next_group_id += 1
+            group_id = email_group_ids[email_key]
+
+        duplicate_mask.append(is_duplicate)
+        duplicate_groups.append(group_id)
+
+    return duplicate_mask, duplicate_groups
+
+
+def detect_richmond_duplicates(dataframe: pd.DataFrame) -> tuple[list[bool], list[int | None]]:
+    normalized_keys: list[tuple[str, str, str]] = []
+    counts: dict[tuple[str, str, str], int] = {}
+
+    for _, row in dataframe.iterrows():
+        first_name = normalize_value(row["First Name"])
+        last_name = normalize_value(row["Last Name"])
+        email = normalize_value(row["Email Address"])
+        key = (first_name, last_name, email)
+        normalized_keys.append(key)
+        counts[key] = counts.get(key, 0) + 1
+
+    duplicate_mask: list[bool] = []
+    duplicate_groups: list[int | None] = []
+    group_ids: dict[tuple[str, str, str], int] = {}
+    next_group_id = 1
+
+    for key in normalized_keys:
+        is_duplicate = counts.get(key, 0) > 1
+        group_id: int | None = None
+        if is_duplicate:
+            if key not in group_ids:
+                group_ids[key] = next_group_id
+                next_group_id += 1
+            group_id = group_ids[key]
+
+        duplicate_mask.append(is_duplicate)
+        duplicate_groups.append(group_id)
+
+    return duplicate_mask, duplicate_groups
+
+
+def build_sheet_payload(
+    dataframe: pd.DataFrame,
+    sheet_name: str,
+    display_columns: list[str],
+    duplicate_columns: list[str],
+    duplicate_rule,
+) -> dict[str, object]:
+    validate_columns(dataframe, display_columns, sheet_name)
+    validate_columns(dataframe, duplicate_columns, sheet_name)
+
+    rows, duplicate_rows, duplicate_groups = build_sheet_rows(dataframe, display_columns, duplicate_rule)
+
+    return {
+        "sheetName": sheet_name,
+        "columns": display_columns,
+        "duplicateCheckColumns": duplicate_columns,
+        "rows": rows,
+        "totalRows": len(rows),
+        "duplicateRows": duplicate_rows,
+        "duplicateGroups": duplicate_groups,
+    }
+
+
 @app.get("/")
 def root():
     return {"status": "Backend running"}
 
 
-# Upload endpoint — accepts one Excel file and validates its extension
 @app.post("/upload")
-async def upload_file(
-    file: UploadFile = File(...),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(25, ge=1, le=200),
-):
-    # Track processing time for the preview response
+async def upload_file(file: UploadFile = File(...)):
     start_time = perf_counter()
 
-    # Make sure a filename exists before checking the extension
     filename = file.filename or ""
-
-    # Only allow Excel file types for now
     if not filename.endswith((".xlsx", ".xls")):
         raise HTTPException(
             status_code=400,
             detail="Invalid file type. Please upload a .xlsx or .xls file.",
         )
 
-    # Read and parse the uploaded Excel file
     try:
         file_bytes = await file.read()
-        dataframe = pd.read_excel(BytesIO(file_bytes))
+        workbook = pd.ExcelFile(BytesIO(file_bytes))
     except Exception as exc:
-        # Return a clear message for invalid/corrupted Excel files
         raise HTTPException(
             status_code=400,
             detail="Unable to read Excel file. Please upload a valid .xlsx or .xls file.",
         ) from exc
 
-    # Duplicate detection is based only on these columns
-    duplicate_check_columns = ["First Name", "Last Name", "Email"]
-
-    # Validate required columns before processing
-    missing_columns = [
-        column for column in duplicate_check_columns if column not in dataframe.columns
+    missing_sheets = [
+        sheet_name for sheet_name in [GUEST_SHEET, RICHMOND_SHEET] if sheet_name not in workbook.sheet_names
     ]
-    if missing_columns:
-        missing_text = ", ".join(missing_columns)
+    if missing_sheets:
+        missing_text = ", ".join(missing_sheets)
         raise HTTPException(
             status_code=400,
-            detail=f"Missing required columns: {missing_text}",
+            detail=f"Missing required sheet(s): {missing_text}",
         )
 
-    # Convert missing values (NaN) to empty strings for the preview response
-    cleaned_dataframe = dataframe.fillna("")
+    try:
+        guest_dataframe = workbook.parse(GUEST_SHEET)
+        richmond_dataframe = workbook.parse(RICHMOND_SHEET)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to read the required worksheet data.",
+        ) from exc
 
-    # Normalize only duplicate-check columns for consistent comparison
-    normalized_keys = cleaned_dataframe[duplicate_check_columns].apply(
-        lambda series: series.fillna("").astype(str).str.strip().str.lower()
+    guest_data = build_sheet_payload(
+        guest_dataframe,
+        GUEST_SHEET,
+        GUEST_COLUMNS,
+        GUEST_DUPLICATE_COLUMNS,
+        detect_guest_duplicates,
+    )
+    richmond_locals = build_sheet_payload(
+        richmond_dataframe,
+        RICHMOND_SHEET,
+        RICHMOND_COLUMNS,
+        RICHMOND_DUPLICATE_COLUMNS,
+        detect_richmond_duplicates,
     )
 
-    # Mark rows as duplicates when another row shares the same normalized key
-    duplicate_mask = normalized_keys.duplicated(keep=False)
-
-    # Build duplicate group IDs for rows that share identical normalized keys
-    duplicate_groups = pd.Series([None] * len(cleaned_dataframe), index=cleaned_dataframe.index)
-    if len(cleaned_dataframe) > 0:
-        group_codes = normalized_keys.groupby(
-            duplicate_check_columns, dropna=False, sort=False
-        ).ngroup() + 1
-        duplicate_groups.loc[duplicate_mask] = group_codes.loc[duplicate_mask].astype(int)
-
-    rows_with_flags = cleaned_dataframe.copy()
-    rows_with_flags["rowId"] = rows_with_flags.index + 1
-    rows_with_flags["isDuplicate"] = duplicate_mask
-    rows_with_flags["duplicateGroup"] = duplicate_groups
-
-    # Build response metadata without returning the full dataset
-    columns = [str(column) for column in cleaned_dataframe.columns.tolist()]
-    total_rows = len(cleaned_dataframe)
-    total_columns = len(columns)
-    duplicate_rows = int(duplicate_mask.sum())
-    duplicate_groups_count = int(duplicate_groups.dropna().nunique())
-
-    # Return only one page of rows for performance
-    total_pages = max(1, (total_rows + page_size - 1) // page_size)
-    current_page = min(page, total_pages)
-    start_index = (current_page - 1) * page_size
-    end_index = start_index + page_size
-    preview_rows = rows_with_flags.iloc[start_index:end_index].to_dict(orient="records")
-    all_rows = rows_with_flags.to_dict(orient="records")
-    processing_time_seconds = round(perf_counter() - start_time, 4)
-
     return {
-        "columns": columns,
-        "totalRows": total_rows,
-        "totalColumns": total_columns,
-        "duplicateRows": duplicate_rows,
-        "duplicateGroups": duplicate_groups_count,
-        "duplicateCheckColumns": duplicate_check_columns,
-        "previewRows": preview_rows,
-        "allRows": all_rows,
-        "currentPage": current_page,
-        "pageSize": page_size,
-        "totalPages": total_pages,
-        "hasMoreRows": end_index < total_rows,
-        "hasManyColumns": total_columns > 20,
-        "processingTimeSeconds": processing_time_seconds,
+        "guestData": guest_data,
+        "richmondLocals": richmond_locals,
+        "processingTimeSeconds": round(perf_counter() - start_time, 4),
     }

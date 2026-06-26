@@ -2,28 +2,42 @@ import axios from 'axios';
 import { useState } from 'react';
 import type { ChangeEvent, CSSProperties, JSX } from 'react';
 
-interface UploadPreviewResponse {
+type SheetKey = 'guestData' | 'richmondLocals';
+
+interface TableRow {
+  rowId: number;
+  isDuplicate: boolean;
+  duplicateGroup: number | null;
+  [key: string]: string | number | boolean | null | undefined;
+}
+
+interface SheetPayload {
+  sheetName: string;
   columns: string[];
+  duplicateCheckColumns: string[];
+  rows: TableRow[];
   totalRows: number;
-  totalColumns: number;
   duplicateRows: number;
   duplicateGroups: number;
-  duplicateCheckColumns: string[];
-  previewRows: PreviewRow[];
-  allRows: PreviewRow[];
-  currentPage: number;
-  pageSize: number;
-  totalPages: number;
-  hasMoreRows: boolean;
-  hasManyColumns: boolean;
+}
+
+interface WorkbookResponse {
+  guestData: SheetPayload;
+  richmondLocals: SheetPayload;
   processingTimeSeconds: number;
 }
 
-interface PreviewRow {
-  rowId: number;
-  isDuplicate?: boolean;
-  duplicateGroup?: number | null;
-  [key: string]: string | number | boolean | null | undefined;
+interface SheetState extends SheetPayload {
+  currentPage: number;
+  pageSize: number;
+  selectedRowIds: number[];
+  deletedRows: number;
+}
+
+interface WorkbookState {
+  guestData: SheetState;
+  richmondLocals: SheetState;
+  processingTimeSeconds: number;
 }
 
 const PAGE_SIZE = 25;
@@ -36,41 +50,107 @@ const normalizeValue = (value: unknown): string => {
   return String(value).trim().toLowerCase();
 };
 
-const recomputeDuplicates = (
-  rows: PreviewRow[],
-  duplicateCheckColumns: string[],
-): {
-  updatedRows: PreviewRow[];
-  duplicateRows: number;
-  duplicateGroups: number;
-} => {
-  const keyCounts = new Map<string, number>();
+const summarizeDuplicates = (
+  rows: TableRow[],
+): { duplicateRows: number; duplicateGroups: number } => ({
+  duplicateRows: rows.filter((row) => row.isDuplicate).length,
+  duplicateGroups: new Set(
+    rows
+      .map((row) => row.duplicateGroup)
+      .filter((value): value is number => typeof value === 'number'),
+  ).size,
+});
+
+const detectGuestDuplicates = (rows: TableRow[]): TableRow[] => {
+  const orderCounts = new Map<string, number>();
+  const emailCounts = new Map<string, number>();
 
   for (const row of rows) {
-    const key = duplicateCheckColumns
-      .map((column) => normalizeValue(row[column]))
-      .join('||');
+    const name = normalizeValue(row['Guest First and Last Name']);
+    const order = normalizeValue(row['Order #']);
+    const email = normalizeValue(row['Guest Email']);
 
-    keyCounts.set(key, (keyCounts.get(key) ?? 0) + 1);
+    if (order) {
+      const orderKey = `${order}|${name}`;
+      orderCounts.set(orderKey, (orderCounts.get(orderKey) ?? 0) + 1);
+    }
+
+    if (email) {
+      const emailKey = `${email}|${name}`;
+      emailCounts.set(emailKey, (emailCounts.get(emailKey) ?? 0) + 1);
+    }
   }
 
+  const orderGroupIds = new Map<string, number>();
+  const emailGroupIds = new Map<string, number>();
   let nextGroupId = 1;
-  const keyToGroup = new Map<string, number>();
 
-  const updatedRows = rows.map((row) => {
-    const key = duplicateCheckColumns
-      .map((column) => normalizeValue(row[column]))
-      .join('||');
+  return rows.map((row) => {
+    const name = normalizeValue(row['Guest First and Last Name']);
+    const order = normalizeValue(row['Order #']);
+    const email = normalizeValue(row['Guest Email']);
 
-    const isDuplicate = (keyCounts.get(key) ?? 0) > 1;
+    const orderKey = `${order}|${name}`;
+    const emailKey = `${email}|${name}`;
+
+    const orderDuplicate = Boolean(order) && (orderCounts.get(orderKey) ?? 0) > 1;
+    const emailDuplicate = Boolean(email) && (emailCounts.get(emailKey) ?? 0) > 1;
+
+    let duplicateGroup: number | null = null;
+    if (orderDuplicate) {
+      if (!orderGroupIds.has(orderKey)) {
+        orderGroupIds.set(orderKey, nextGroupId);
+        nextGroupId += 1;
+      }
+      duplicateGroup = orderGroupIds.get(orderKey) ?? null;
+    } else if (emailDuplicate) {
+      if (!emailGroupIds.has(emailKey)) {
+        emailGroupIds.set(emailKey, nextGroupId);
+        nextGroupId += 1;
+      }
+      duplicateGroup = emailGroupIds.get(emailKey) ?? null;
+    }
+
+    return {
+      ...row,
+      isDuplicate: orderDuplicate || emailDuplicate,
+      duplicateGroup,
+    };
+  });
+};
+
+const detectRichmondDuplicates = (rows: TableRow[]): TableRow[] => {
+  const counts = new Map<string, number>();
+
+  for (const row of rows) {
+    const key = [
+      normalizeValue(row['First Name']),
+      normalizeValue(row['Last Name']),
+      normalizeValue(row['Email Address']),
+    ].join('|');
+
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+
+  const groupIds = new Map<string, number>();
+  let nextGroupId = 1;
+
+  return rows.map((row) => {
+    const key = [
+      normalizeValue(row['First Name']),
+      normalizeValue(row['Last Name']),
+      normalizeValue(row['Email Address']),
+    ].join('|');
+
+    const isDuplicate = (counts.get(key) ?? 0) > 1;
     let duplicateGroup: number | null = null;
 
     if (isDuplicate) {
-      if (!keyToGroup.has(key)) {
-        keyToGroup.set(key, nextGroupId);
+      if (!groupIds.has(key)) {
+        groupIds.set(key, nextGroupId);
         nextGroupId += 1;
       }
-      duplicateGroup = keyToGroup.get(key) ?? null;
+      duplicateGroup = groupIds.get(key) ?? null;
     }
 
     return {
@@ -79,47 +159,71 @@ const recomputeDuplicates = (
       duplicateGroup,
     };
   });
+};
 
-  const duplicateRows = updatedRows.filter((row) => row.isDuplicate).length;
-  const duplicateGroups = new Set(
-    updatedRows
-      .map((row) => row.duplicateGroup)
-      .filter((value): value is number => typeof value === 'number'),
-  ).size;
+const rebuildGuestSheet = (rows: TableRow[], deletedRows = 0): SheetState => {
+  const duplicatedRows = detectGuestDuplicates(rows);
+  const summary = summarizeDuplicates(duplicatedRows);
 
   return {
-    updatedRows,
-    duplicateRows,
-    duplicateGroups,
+    sheetName: 'Guest Data',
+    columns: [
+      'Order #',
+      'Guest First and Last Name',
+      'Guest Gender',
+      'Guest Email',
+      'Guest Phone Number',
+      'City',
+      'State',
+    ],
+    duplicateCheckColumns: ['Order #', 'Guest First and Last Name', 'Guest Email'],
+    rows: duplicatedRows,
+    totalRows: duplicatedRows.length,
+    duplicateRows: summary.duplicateRows,
+    duplicateGroups: summary.duplicateGroups,
+    currentPage: 1,
+    pageSize: PAGE_SIZE,
+    selectedRowIds: [],
+    deletedRows,
   };
 };
 
-// FileUpload component — handles Excel file selection and upload
+const rebuildRichmondSheet = (rows: TableRow[], deletedRows = 0): SheetState => {
+  const duplicatedRows = detectRichmondDuplicates(rows);
+  const summary = summarizeDuplicates(duplicatedRows);
+
+  return {
+    sheetName: 'Richmond Locals',
+    columns: ['First Name', 'Last Name', 'Email Address'],
+    duplicateCheckColumns: ['First Name', 'Last Name', 'Email Address'],
+    rows: duplicatedRows,
+    totalRows: duplicatedRows.length,
+    duplicateRows: summary.duplicateRows,
+    duplicateGroups: summary.duplicateGroups,
+    currentPage: 1,
+    pageSize: PAGE_SIZE,
+    selectedRowIds: [],
+    deletedRows,
+  };
+};
+
 function FileUpload(): JSX.Element {
-  // Track the selected file and UI messages
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState<boolean>(false);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [previewData, setPreviewData] = useState<UploadPreviewResponse | null>(null);
-  const [currentPage, setCurrentPage] = useState<number>(1);
-  const [selectedRowIds, setSelectedRowIds] = useState<number[]>([]);
+  const [workbookData, setWorkbookData] = useState<WorkbookState | null>(null);
 
-  // Called whenever the user picks a file from the input
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>): void => {
     const file = e.target.files?.[0] ?? null;
-
     setSelectedFile(file);
     setFileName(file ? file.name : null);
     setSuccessMessage(null);
     setErrorMessage(null);
-    setPreviewData(null);
-    setCurrentPage(1);
-    setSelectedRowIds([]);
+    setWorkbookData(null);
   };
 
-  // Upload file and fetch processed rows
   const uploadFile = async (): Promise<void> => {
     if (!selectedFile) {
       return;
@@ -133,121 +237,259 @@ function FileUpload(): JSX.Element {
     setErrorMessage(null);
 
     try {
-      const response = await axios.post<UploadPreviewResponse>('http://localhost:8000/upload', formData, {
+      const response = await axios.post<WorkbookResponse>('http://localhost:8000/upload', formData, {
         headers: {
           'Content-Type': 'multipart/form-data',
         },
       });
 
-      setPreviewData(response.data);
-      setCurrentPage(1);
-      setSelectedRowIds([]);
-      setSuccessMessage('File preview loaded successfully.');
+      setWorkbookData({
+        guestData: {
+          ...response.data.guestData,
+          currentPage: 1,
+          pageSize: PAGE_SIZE,
+          selectedRowIds: [],
+          deletedRows: 0,
+        },
+        richmondLocals: {
+          ...response.data.richmondLocals,
+          currentPage: 1,
+          pageSize: PAGE_SIZE,
+          selectedRowIds: [],
+          deletedRows: 0,
+        },
+        processingTimeSeconds: response.data.processingTimeSeconds,
+      });
+
+      setSuccessMessage('Workbook loaded successfully.');
     } catch (error: unknown) {
       if (axios.isAxiosError<{ detail?: string }>(error)) {
         const detail = error.response?.data?.detail;
-        const message =
-          typeof detail === 'string' ? detail : 'Upload failed. Please try again.';
-
-        setErrorMessage(message);
-        setPreviewData(null);
+        setErrorMessage(typeof detail === 'string' ? detail : 'Upload failed. Please try again.');
       } else {
         setErrorMessage('Upload failed. Please try again.');
-        setPreviewData(null);
       }
+
+      setWorkbookData(null);
     } finally {
       setIsUploading(false);
     }
   };
 
-  // Upload the selected file to the backend
-  const handleUpload = async (): Promise<void> => {
-    await uploadFile();
-  };
+  const updateSheet = (sheetKey: SheetKey, updater: (sheet: SheetState) => SheetState): void => {
+    setWorkbookData((prev) => {
+      if (!prev) {
+        return prev;
+      }
 
-  // Toggle one row checkbox
-  const toggleRowSelection = (rowId: number): void => {
-    setSelectedRowIds((prev) =>
-      prev.includes(rowId) ? prev.filter((id) => id !== rowId) : [...prev, rowId],
-    );
-  };
-
-  // Remove selected rows and recompute duplicate flags/counts
-  const handleRemoveSelected = (): void => {
-    if (!previewData || selectedRowIds.length === 0) {
-      return;
-    }
-
-    const remainingRows = previewData.allRows.filter(
-      (row) => !selectedRowIds.includes(row.rowId),
-    );
-
-    const duplicateResult = recomputeDuplicates(
-      remainingRows,
-      previewData.duplicateCheckColumns,
-    );
-
-    setPreviewData({
-      ...previewData,
-      allRows: duplicateResult.updatedRows,
-      previewRows: duplicateResult.updatedRows.slice(0, PAGE_SIZE),
-      totalRows: duplicateResult.updatedRows.length,
-      duplicateRows: duplicateResult.duplicateRows,
-      duplicateGroups: duplicateResult.duplicateGroups,
-      totalPages: Math.max(1, Math.ceil(duplicateResult.updatedRows.length / PAGE_SIZE)),
-      currentPage: 1,
-      hasMoreRows: duplicateResult.updatedRows.length > PAGE_SIZE,
+      return {
+        ...prev,
+        [sheetKey]: updater(prev[sheetKey]),
+      };
     });
-
-    setCurrentPage(1);
-    setSelectedRowIds([]);
-    setSuccessMessage(`Removed ${selectedRowIds.length} record(s).`);
   };
 
-  // Export remaining rows to .xlsx — xlsx is imported lazily to avoid blocking initial render
-  const handleExport = async (): Promise<void> => {
-    if (!previewData || previewData.allRows.length === 0) {
+  const handleRemoveSelected = (sheetKey: SheetKey): void => {
+    updateSheet(sheetKey, (sheet) => {
+      if (sheet.selectedRowIds.length === 0) {
+        return sheet;
+      }
+
+      const remainingRows = sheet.rows.filter((row) => !sheet.selectedRowIds.includes(row.rowId));
+      const deletedCount = sheet.deletedRows + sheet.selectedRowIds.length;
+
+      return sheetKey === 'guestData'
+        ? rebuildGuestSheet(remainingRows, deletedCount)
+        : rebuildRichmondSheet(remainingRows, deletedCount);
+    });
+  };
+
+  const toggleRowSelection = (sheetKey: SheetKey, rowId: number): void => {
+    updateSheet(sheetKey, (sheet) => ({
+      ...sheet,
+      selectedRowIds: sheet.selectedRowIds.includes(rowId)
+        ? sheet.selectedRowIds.filter((id) => id !== rowId)
+        : [...sheet.selectedRowIds, rowId],
+    }));
+  };
+
+  const toggleSelectAllOnPage = (sheetKey: SheetKey, pageRowIds: number[]): void => {
+    updateSheet(sheetKey, (sheet) => {
+      const allSelected =
+        pageRowIds.length > 0 && pageRowIds.every((rowId) => sheet.selectedRowIds.includes(rowId));
+
+      return {
+        ...sheet,
+        selectedRowIds: allSelected
+          ? sheet.selectedRowIds.filter((rowId) => !pageRowIds.includes(rowId))
+          : Array.from(new Set([...sheet.selectedRowIds, ...pageRowIds])),
+      };
+    });
+  };
+
+  const exportWorkbook = async (): Promise<void> => {
+    if (!workbookData) {
       return;
     }
 
     const XLSX = await import('xlsx');
-
-    const exportRows = previewData.allRows.map((row) => {
-      const exportRow: Record<string, string | number | boolean | null | undefined> = {};
-
-      for (const column of previewData.columns) {
-        exportRow[column] = row[column] ?? '';
-      }
-
-      return exportRow;
-    });
-
-    const worksheet = XLSX.utils.json_to_sheet(exportRows, { header: previewData.columns });
     const workbook = XLSX.utils.book_new();
 
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Remaining Records');
+    const addSheet = (sheet: SheetState, sheetName: string): void => {
+      const exportRows = sheet.rows.map((row) => {
+        const record: Record<string, string | number | boolean | null | undefined> = {};
+
+        for (const column of sheet.columns) {
+          record[column] = row[column] ?? '';
+        }
+
+        return record;
+      });
+
+      const worksheet = XLSX.utils.json_to_sheet(exportRows, { header: sheet.columns });
+      XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
+    };
+
+    addSheet(workbookData.guestData, 'Guest Data');
+    addSheet(workbookData.richmondLocals, 'Richmond Locals');
     XLSX.writeFile(workbook, 'remaining_records.xlsx');
   };
 
-  const allRows = previewData?.allRows ?? [];
-  const totalPages = Math.max(1, Math.ceil(allRows.length / PAGE_SIZE));
-  const safeCurrentPage = Math.min(currentPage, totalPages);
-  const startIndex = (safeCurrentPage - 1) * PAGE_SIZE;
-  const endIndex = startIndex + PAGE_SIZE;
-  const pagedRows = allRows.slice(startIndex, endIndex);
-
-  const allRowsOnPageSelected =
-    pagedRows.length > 0 && pagedRows.every((row) => selectedRowIds.includes(row.rowId));
-
-  const toggleSelectAllOnPage = (): void => {
-    const pageIds = pagedRows.map((row) => row.rowId);
-
-    if (allRowsOnPageSelected) {
-      setSelectedRowIds((prev) => prev.filter((id) => !pageIds.includes(id)));
-      return;
+  const renderSheet = (sheetKey: SheetKey, title: string): JSX.Element | null => {
+    if (!workbookData) {
+      return null;
     }
 
-    setSelectedRowIds((prev) => Array.from(new Set([...prev, ...pageIds])));
+    const sheet = workbookData[sheetKey];
+    if (!sheet || !Array.isArray(sheet.columns) || !Array.isArray(sheet.rows)) {
+      return null;
+    }
+
+    const totalPages = Math.max(1, Math.ceil(sheet.rows.length / sheet.pageSize));
+    const currentPage = Math.min(sheet.currentPage, totalPages);
+    const startIndex = (currentPage - 1) * sheet.pageSize;
+    const pageRows = sheet.rows.slice(startIndex, startIndex + sheet.pageSize);
+    const pageRowIds = pageRows.map((row) => row.rowId);
+    const allSelected =
+      pageRows.length > 0 && pageRows.every((row) => sheet.selectedRowIds.includes(row.rowId));
+
+    return (
+      <section style={styles.sheetSection}>
+        <div style={styles.sheetHeaderRow}>
+          <div>
+            <h2 style={styles.sheetTitle}>{title}</h2>
+            <p style={styles.sheetSubtitle}>
+              Duplicates are checked using{' '}
+              {sheetKey === 'guestData'
+                ? 'Order #, Guest First and Last Name, and Guest Email.'
+                : 'First Name, Last Name, and Email Address.'}
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => handleRemoveSelected(sheetKey)}
+            disabled={sheet.selectedRowIds.length === 0}
+            style={{
+              ...styles.removeButton,
+              ...(sheet.selectedRowIds.length === 0 ? styles.removeButtonDisabled : {}),
+            }}
+          >
+            Remove checked ({sheet.selectedRowIds.length})
+          </button>
+        </div>
+
+        <div style={styles.summaryGrid}>
+          <SummaryCard label="Remaining rows" value={sheet.rows.length} />
+          <SummaryCard label="Deleted rows" value={sheet.deletedRows} />
+          <SummaryCard label="Duplicate rows" value={sheet.duplicateRows} />
+          <SummaryCard label="Duplicate groups" value={sheet.duplicateGroups} />
+        </div>
+
+        <div style={styles.tableWrapper}>
+          <table style={styles.table}>
+            <thead>
+              <tr>
+                <th style={styles.checkboxHeaderCell}>
+                  <input
+                    type="checkbox"
+                    checked={allSelected}
+                    onChange={() => toggleSelectAllOnPage(sheetKey, pageRowIds)}
+                  />
+                </th>
+                {sheet.columns.map((column) => (
+                  <th key={column} style={styles.tableHeaderCell}>
+                    {column}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {pageRows.map((row) => (
+                <tr key={`${sheetKey}-${row.rowId}`} style={row.isDuplicate ? styles.duplicateRow : undefined}>
+                  <td style={styles.checkboxCell}>
+                    <input
+                      type="checkbox"
+                      checked={sheet.selectedRowIds.includes(row.rowId)}
+                      onChange={() => toggleRowSelection(sheetKey, row.rowId)}
+                    />
+                  </td>
+                  {sheet.columns.map((column) => (
+                    <td key={`${sheetKey}-${row.rowId}-${column}`} style={styles.tableCell}>
+                      {String(row[column] ?? '')}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div style={styles.paginationRow}>
+          <button
+            type="button"
+            disabled={currentPage <= 1}
+            onClick={() =>
+              updateSheet(sheetKey, (value) => ({
+                ...value,
+                currentPage: Math.max(1, value.currentPage - 1),
+              }))
+            }
+            style={{
+              ...styles.paginationButton,
+              ...(currentPage <= 1 ? styles.paginationButtonDisabled : {}),
+            }}
+          >
+            Previous
+          </button>
+
+          <p style={styles.paginationText}>
+            Page {currentPage} of {totalPages}
+          </p>
+
+          <button
+            type="button"
+            disabled={currentPage >= totalPages}
+            onClick={() =>
+              updateSheet(sheetKey, (value) => ({
+                ...value,
+                currentPage: Math.min(totalPages, value.currentPage + 1),
+              }))
+            }
+            style={{
+              ...styles.paginationButton,
+              ...(currentPage >= totalPages ? styles.paginationButtonDisabled : {}),
+            }}
+          >
+            Next
+          </button>
+        </div>
+
+        <p style={styles.noteText}>
+          Showing {pageRows.length} of {sheet.rows.length} rows on this page.
+        </p>
+      </section>
+    );
   };
 
   return (
@@ -256,7 +498,6 @@ function FileUpload(): JSX.Element {
         Choose Excel File
       </label>
 
-      {/* Accept only .xlsx and .xls formats */}
       <input
         id="excel-upload"
         type="file"
@@ -265,18 +506,15 @@ function FileUpload(): JSX.Element {
         style={styles.input}
       />
 
-      {/* Show the selected file name, or a placeholder if none chosen */}
-      <p style={styles.fileName}>
-        {fileName ? `Selected: ${fileName}` : 'No file selected'}
-      </p>
+      <p style={styles.fileName}>{fileName ? `Selected: ${fileName}` : 'No file selected'}</p>
 
       <button
         type="button"
-        onClick={handleUpload}
+        onClick={uploadFile}
         disabled={!selectedFile || isUploading}
         style={{
-          ...styles.button,
-          ...((!selectedFile || isUploading) ? styles.buttonDisabled : {}),
+          ...styles.uploadButton,
+          ...((!selectedFile || isUploading) ? styles.uploadButtonDisabled : {}),
         }}
       >
         {isUploading ? 'Uploading...' : 'Upload'}
@@ -285,141 +523,52 @@ function FileUpload(): JSX.Element {
       {successMessage && <p style={styles.successMessage}>{successMessage}</p>}
       {errorMessage && <p style={styles.errorMessage}>{errorMessage}</p>}
 
-      {previewData && (
-        <div style={styles.previewSection}>
-          <div style={styles.summaryGrid}>
-            <div style={styles.summaryCard}>
-              <p style={styles.summaryLabel}>Total rows</p>
-              <p style={styles.summaryValue}>{previewData.totalRows}</p>
-            </div>
-            <div style={styles.summaryCard}>
-              <p style={styles.summaryLabel}>Duplicate rows</p>
-              <p style={styles.summaryValue}>{previewData.duplicateRows}</p>
-            </div>
-            <div style={styles.summaryCard}>
-              <p style={styles.summaryLabel}>Duplicate groups</p>
-              <p style={styles.summaryValue}>{previewData.duplicateGroups}</p>
-            </div>
-          </div>
-
-          <div style={styles.actionsRow}>
+      {workbookData && (
+        <>
+          <div style={styles.exportBar}>
             <button
               type="button"
-              onClick={handleRemoveSelected}
-              disabled={selectedRowIds.length === 0}
-              style={{
-                ...styles.removeButton,
-                ...(selectedRowIds.length === 0 ? styles.removeButtonDisabled : {}),
-              }}
-            >
-              Remove checked ({selectedRowIds.length})
-            </button>
-
-            <button
-              type="button"
-              onClick={handleExport}
-              disabled={allRows.length === 0}
+              onClick={exportWorkbook}
+              disabled={
+                workbookData.guestData.rows.length === 0 && workbookData.richmondLocals.rows.length === 0
+              }
               style={{
                 ...styles.exportButton,
-                ...(allRows.length === 0 ? styles.exportButtonDisabled : {}),
-              }}
-            >
-              Export remaining (.xlsx)
-            </button>
-          </div>
-
-          <div style={styles.tableWrapper}>
-            <table style={styles.table}>
-              <thead>
-                <tr>
-                  <th style={styles.tableHeaderCheckbox}>
-                    <input
-                      type="checkbox"
-                      checked={allRowsOnPageSelected}
-                      onChange={toggleSelectAllOnPage}
-                    />
-                  </th>
-                  {previewData.columns.map((column) => (
-                    <th key={column} style={styles.tableHeader}>
-                      {column}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {pagedRows.map((row, rowIndex) => (
-                  <tr
-                    key={`row-${row.rowId}`}
-                    style={row.isDuplicate ? styles.duplicateRow : undefined}
-                  >
-                    <td style={styles.tableCellCheckbox}>
-                      <input
-                        type="checkbox"
-                        checked={selectedRowIds.includes(row.rowId)}
-                        onChange={() => toggleRowSelection(row.rowId)}
-                      />
-                    </td>
-                    {previewData.columns.map((column) => (
-                      <td key={`${column}-${row.rowId}-${rowIndex}`} style={styles.tableCell}>
-                        {String(row[column] ?? '')}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          <div style={styles.paginationContainer}>
-            <button
-              type="button"
-              disabled={isUploading || safeCurrentPage <= 1}
-              onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
-              style={{
-                ...styles.paginationButton,
-                ...((isUploading || safeCurrentPage <= 1)
-                  ? styles.paginationButtonDisabled
+                ...(workbookData.guestData.rows.length === 0 &&
+                workbookData.richmondLocals.rows.length === 0
+                  ? styles.exportButtonDisabled
                   : {}),
               }}
             >
-              Previous
+              Export remaining records to .xlsx
             </button>
 
-            <p style={styles.paginationText}>
-              Page {safeCurrentPage} of {totalPages}
+            <p style={styles.exportNote}>
+              A single Excel workbook will be created with Guest Data and Richmond Locals tabs.
             </p>
-
-            <button
-              type="button"
-              disabled={isUploading || safeCurrentPage >= totalPages}
-              onClick={() => setCurrentPage((prev) => Math.min(totalPages, prev + 1))}
-              style={{
-                ...styles.paginationButton,
-                ...((isUploading || safeCurrentPage >= totalPages)
-                  ? styles.paginationButtonDisabled
-                  : {}),
-              }}
-            >
-              Next
-            </button>
           </div>
 
-          <p style={styles.duplicateRuleText}>
-            Duplicates are checked using First Name, Last Name, and Email.
+          {renderSheet('guestData', 'Guest Data')}
+          {renderSheet('richmondLocals', 'Richmond Locals')}
+
+          <p style={styles.processingText}>
+            Processing time: {workbookData.processingTimeSeconds.toFixed(4)} seconds
           </p>
-
-          {totalPages > 1 && (
-            <p style={styles.noteText}>
-              Showing 25 rows per page.
-            </p>
-          )}
-        </div>
+        </>
       )}
     </div>
   );
 }
 
-// Inline styles — simple and self-contained
+function SummaryCard({ label, value }: { label: string; value: number }): JSX.Element {
+  return (
+    <div style={styles.summaryCard}>
+      <p style={styles.summaryLabel}>{label}</p>
+      <p style={styles.summaryValue}>{value}</p>
+    </div>
+  );
+}
+
 const styles: Record<string, CSSProperties> = {
   container: {
     display: 'flex',
@@ -431,7 +580,7 @@ const styles: Record<string, CSSProperties> = {
     border: '2px dashed #ccc',
     borderRadius: '8px',
     width: '100%',
-    maxWidth: '1100px',
+    maxWidth: '1400px',
   },
   label: {
     display: 'inline-block',
@@ -444,7 +593,6 @@ const styles: Record<string, CSSProperties> = {
     fontSize: '0.95rem',
   },
   input: {
-    // Visually hidden — the label acts as the clickable trigger
     display: 'none',
   },
   fileName: {
@@ -452,7 +600,7 @@ const styles: Record<string, CSSProperties> = {
     color: '#555',
     margin: 0,
   },
-  button: {
+  uploadButton: {
     padding: '0.6rem 1.25rem',
     backgroundColor: '#16a34a',
     color: '#fff',
@@ -462,9 +610,37 @@ const styles: Record<string, CSSProperties> = {
     fontWeight: 600,
     fontSize: '0.95rem',
   },
-  buttonDisabled: {
+  uploadButtonDisabled: {
     backgroundColor: '#9ca3af',
     cursor: 'not-allowed',
+  },
+  exportBar: {
+    width: '100%',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'flex-start',
+    gap: '0.5rem',
+    marginTop: '0.75rem',
+  },
+  exportButton: {
+    border: 'none',
+    backgroundColor: '#2563eb',
+    color: '#fff',
+    borderRadius: '6px',
+    padding: '0.6rem 1rem',
+    fontSize: '0.9rem',
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  exportButtonDisabled: {
+    backgroundColor: '#93c5fd',
+    cursor: 'not-allowed',
+  },
+  exportNote: {
+    margin: 0,
+    fontSize: '0.85rem',
+    color: '#4b5563',
+    textAlign: 'left',
   },
   successMessage: {
     fontSize: '0.9rem',
@@ -478,14 +654,53 @@ const styles: Record<string, CSSProperties> = {
     margin: 0,
     textAlign: 'center',
   },
-  previewSection: {
+  sheetSection: {
     width: '100%',
     marginTop: '1rem',
+    paddingTop: '1rem',
+    borderTop: '1px solid #e5e7eb',
+  },
+  sheetHeaderRow: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: '1rem',
+    marginBottom: '0.75rem',
+    flexWrap: 'wrap',
+  },
+  sheetTitle: {
+    margin: 0,
+    fontSize: '1.4rem',
+    fontWeight: 700,
+    color: '#111827',
+    textAlign: 'left',
+  },
+  sheetSubtitle: {
+    margin: '0.35rem 0 0',
+    fontSize: '0.9rem',
+    color: '#4b5563',
+    textAlign: 'left',
+  },
+  removeButton: {
+    border: 'none',
+    backgroundColor: '#dc2626',
+    color: '#fff',
+    borderRadius: '6px',
+    padding: '0.6rem 1rem',
+    fontSize: '0.9rem',
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  removeButtonDisabled: {
+    backgroundColor: '#fca5a5',
+    cursor: 'not-allowed',
   },
   summaryGrid: {
     display: 'grid',
-    gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+    gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
     gap: '0.75rem',
+    width: '100%',
+    marginBottom: '0.75rem',
   },
   summaryCard: {
     border: '1px solid #e5e7eb',
@@ -500,19 +715,9 @@ const styles: Record<string, CSSProperties> = {
     textAlign: 'left',
   },
   summaryValue: {
-    margin: '0.3rem 0 0',
+    margin: '0.25rem 0 0',
     fontSize: '1rem',
     fontWeight: 700,
-    color: '#111827',
-    textAlign: 'left',
-  },
-  duplicateRow: {
-    backgroundColor: '#fff1f2',
-  },
-  summaryText: {
-    margin: 0,
-    fontSize: '0.95rem',
-    fontWeight: 600,
     color: '#111827',
     textAlign: 'left',
   },
@@ -523,15 +728,15 @@ const styles: Record<string, CSSProperties> = {
     maxHeight: '420px',
     border: '1px solid #d1d5db',
     borderRadius: '8px',
-    marginTop: '0.75rem',
+    marginTop: '0.25rem',
   },
   table: {
     width: '100%',
     borderCollapse: 'collapse',
-    minWidth: '700px',
+    minWidth: '900px',
     backgroundColor: '#ffffff',
   },
-  tableHeader: {
+  tableHeaderCell: {
     padding: '0.75rem',
     borderBottom: '1px solid #d1d5db',
     backgroundColor: '#f3f4f6',
@@ -541,8 +746,10 @@ const styles: Record<string, CSSProperties> = {
     color: '#111827',
     position: 'sticky',
     top: 0,
+    zIndex: 1,
+    whiteSpace: 'nowrap',
   },
-  tableHeaderCheckbox: {
+  checkboxHeaderCell: {
     width: '44px',
     minWidth: '44px',
     padding: '0.75rem 0.5rem',
@@ -551,6 +758,7 @@ const styles: Record<string, CSSProperties> = {
     textAlign: 'center',
     position: 'sticky',
     top: 0,
+    zIndex: 1,
   },
   tableCell: {
     padding: '0.75rem',
@@ -560,61 +768,17 @@ const styles: Record<string, CSSProperties> = {
     color: '#374151',
     whiteSpace: 'nowrap',
   },
-  tableCellCheckbox: {
+  checkboxCell: {
     width: '44px',
     minWidth: '44px',
     textAlign: 'center',
     borderBottom: '1px solid #e5e7eb',
     padding: '0.75rem 0.5rem',
   },
-  noteText: {
-    margin: '0.75rem 0 0',
-    fontSize: '0.85rem',
-    color: '#6b7280',
-    textAlign: 'left',
+  duplicateRow: {
+    backgroundColor: '#fff1f2',
   },
-  duplicateRuleText: {
-    margin: '0.75rem 0 0',
-    fontSize: '0.85rem',
-    color: '#374151',
-    textAlign: 'left',
-  },
-  actionsRow: {
-    marginTop: '0.75rem',
-    display: 'flex',
-    gap: '0.75rem',
-    flexWrap: 'wrap',
-    justifyContent: 'flex-start',
-  },
-  removeButton: {
-    border: 'none',
-    backgroundColor: '#dc2626',
-    color: '#ffffff',
-    borderRadius: '6px',
-    padding: '0.5rem 1rem',
-    fontSize: '0.85rem',
-    fontWeight: 600,
-    cursor: 'pointer',
-  },
-  removeButtonDisabled: {
-    backgroundColor: '#fca5a5',
-    cursor: 'not-allowed',
-  },
-  exportButton: {
-    border: 'none',
-    backgroundColor: '#2563eb',
-    color: '#ffffff',
-    borderRadius: '6px',
-    padding: '0.5rem 1rem',
-    fontSize: '0.85rem',
-    fontWeight: 600,
-    cursor: 'pointer',
-  },
-  exportButtonDisabled: {
-    backgroundColor: '#93c5fd',
-    cursor: 'not-allowed',
-  },
-  paginationContainer: {
+  paginationRow: {
     marginTop: '0.75rem',
     display: 'flex',
     alignItems: 'center',
@@ -625,7 +789,7 @@ const styles: Record<string, CSSProperties> = {
     border: '1px solid #d1d5db',
     backgroundColor: '#ffffff',
     borderRadius: '6px',
-    padding: '0.4rem 0.9rem',
+    padding: '0.45rem 0.9rem',
     fontSize: '0.85rem',
     fontWeight: 600,
     color: '#111827',
@@ -641,6 +805,17 @@ const styles: Record<string, CSSProperties> = {
     fontSize: '0.85rem',
     color: '#374151',
     fontWeight: 600,
+  },
+  noteText: {
+    margin: '0.6rem 0 0',
+    fontSize: '0.85rem',
+    color: '#6b7280',
+    textAlign: 'left',
+  },
+  processingText: {
+    marginTop: '1rem',
+    fontSize: '0.85rem',
+    color: '#6b7280',
   },
 };
 
